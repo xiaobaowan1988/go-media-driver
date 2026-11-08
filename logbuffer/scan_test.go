@@ -89,3 +89,37 @@ func TestInsertRejectsConsumedFrame(t *testing.T) {
 		t.Fatalf("want ErrStale, got %v", err)
 	}
 }
+
+func TestContiguousEndAndGapEnd(t *testing.T) {
+	src := newLB(t, MinTermLength, 1408)
+	dst := newLB(t, MinTermLength, 1408)
+	for i := 0; i < 6; i++ {
+		src.Offer(make([]byte, 40)) // 96-byte frames
+	}
+	var frames [][]byte
+	for pos := int64(0); ; {
+		b, adv := src.ScanBlock(pos, 96)
+		if adv == 0 {
+			break
+		}
+		frames = append(frames, append([]byte(nil), b...))
+		pos += int64(adv)
+	}
+	dst.Insert(frames[0])
+	dst.Insert(frames[3]) // hole: frames 1 and 2
+	dst.Insert(frames[4])
+	if end := dst.ContiguousEnd(0); end != 96 {
+		t.Fatalf("contiguous end %d, want 96", end)
+	}
+	if end := dst.GapEnd(96, 5*96); end != 3*96 {
+		t.Fatalf("gap end %d, want %d", end, 3*96)
+	}
+	if end := dst.GapEnd(96, 2*96); end != 2*96 {
+		t.Fatalf("gap end must respect the limit, got %d", end)
+	}
+	dst.Insert(frames[1])
+	dst.Insert(frames[2])
+	if end := dst.ContiguousEnd(96); end != 5*96 {
+		t.Fatalf("contiguous end %d, want %d", end, 5*96)
+	}
+}

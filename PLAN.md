@@ -37,13 +37,13 @@
 ## 阶段三:控制面与流控状态机 (Weeks 5-6)
 **目标**:实现网络异常处理、丢包重传与滑动窗口机制。
 
-- [ ] **Conductor 线程 (指挥官)**
+- [x] **Conductor 线程 (指挥官)**
   - 管理 IPC 命令通道(新建 Publication/Subscription)。
   - 周期性执行资源垃圾回收,清理并轮转 Dirty Term。
-- [ ] **NAK 抑制与重传机制 (Negative Acknowledgement)**
+- [x] **NAK 抑制与重传机制 (Negative Acknowledgement)**
   - 接收端序列号连续性校验:发现 Term Offset 跳跃时,立即在 Tx 队列生成 NAK 控制报文。
   - 发送端重传缓冲区:收到 NAK 后,直接根据偏移量回溯 LogBuffer,定位历史 Raft 日志并重新发送。
-- [ ] **Status Message (SM) 滑动窗口**
+- [x] **Status Message (SM) 滑动窗口**
   - 接收端定时发射 SM 报文,同步当前 Consumer Position 和可用 Receiver Window。
   - 发送端实时计算背压(Backpressure),窗口耗尽时拒绝 Raft 状态机的 `TryClaim` 请求,迫使业务层主动降速。
 
@@ -77,16 +77,26 @@
 - 协议简化:Sender 的 Socket 对接收端 `connect`;接收端用 `recvfrom` 学到对端地址(阶段三回 SM/NAK 用)。阶段二尚无流控,测试中用"消费者推进 PublisherLimit"代替 SM。
 - 驱动类型:`driver.NetworkPublication`(发送侧状态)、`driver.Sender`(duty cycle `DoWork`/`Run`)、`driver.NetworkSubscription`、`driver.Receiver`。空闲策略 `IdleStrategy` 支持 BusySpin(默认)/Yield/Sleep,测试里用 Yield 以免在小核数机器上饿死别的 goroutine。
 
+### 阶段三
+- **控制帧**(`protocol`,均 32 字节,头 8 字节与 DATA 共用:length/version/flags/type):`NAK{session,stream,termID,termOffset,length}`、`SM{session,stream,consumerTermID,consumerTermOffset,receiverWindow}`。
+- **接收端(`NetworkSubscription`,仅接收线程访问)**:维护 `hwm`(见过的最高位置,来自 DATA 帧或心跳)与 `complete`(连续已收位置,由 `LogBuffer.ContiguousEnd` 增量推进)。`hwm > complete` 即为丢包:`LogBuffer.GapEnd` 扫描零长度区得到缺口,**立即**发 NAK;同一缺口在 `NakInterval` 内抑制重复 NAK(NAK 抑制),超时仍未补齐则重发。SM 每 `SMInterval` 或消费位置前进 ≥ window/4 时发送,携带订阅者位置(`ConsumerPosition`)与 window。对端地址由 `recvfrom` 学得。
+- **发送端(`NetworkPublication`,仅发送线程访问)**:同一个 connected socket 也收控制帧。SM → `consumerPos = max(...)`,`PublisherLimit = consumerPos + window`(背压:窗口耗尽时 `TryClaim` 返回 `ErrBackPressured`);初始 limit = 配置的初始窗口。NAK → 校验区间在 `[consumerPos, senderPos]` 内后进入固定大小的重传队列(同起点在 `RetransmitLinger` 内去重),每个 duty cycle 重传一批(直接从 LogBuffer 回溯,复用 `ScanBlock`)。空闲超过 `HeartbeatInterval` 发送只含头的 DATA 帧(`FrameLength=0`,term/offset=senderPos),使尾部丢包也能被发现、使接收端学到对端地址。
+- 约束:`window ≤ termLength/2`,保证发送端最多领先消费者半个 term,三个 term 轮转不会死锁;接收端 `Insert` 以"槽位已清理"为激活下一个 term 的门槛。
+- **Conductor**(`driver.Conductor`):消费 `<dir>/to-driver.ipc`(一个 LogBuffer,客户端多生产者 CAS 追加,Conductor 单消费者)里的命令 `AddPublication/AddSubscription/Remove`;每个客户端自带响应 LogBuffer 文件(路径写在命令里,驱动单写者、客户端单读者并负责清理),响应 `READY{path}/OK/ERROR{msg}`。周期性 housekeeping:对发布日志以 `consumerPos`(SM)、对订阅日志以 `ConsumerPosition` 调用 `CleanConsumed` 轮转 Dirty Term;移除的发布/订阅在 Sender/Receiver 经过 2 个 duty cycle 的宽限后才关闭映射。
+- 简化:不实现 SETUP 握手(两端 term 长度/初始 termID/MTU 由命令静态配置,Raft 集群成员本来就是静态已知);一个驱动只有一个接收端点(`ReceiveIP:ReceivePort`),按 (session,stream) 分发;发布侧每个 publication 一个 connected socket。
+- 测试:`TestLossy*` 用用户态 UDP 代理注入丢包/重复/乱序(双向),验证按序无丢失、堆内存不增长、窗口耗尽时背压。
+
 ### 里程碑与验收标准
 | 里程碑 | 核心产出 | 验收标准 |
 | :--- | :--- | :--- |
 | **M1: IPC 联通** ✅ | LogBuffer 结构与 CAS 写机制 | 假 Media Driver 进程与 Raft 进程本地内存读写达到千万级 QPS。实测(4 核沙箱,生产者/消费者两个 goroutine,32B 负载):1600~2100 万 msgs/s,0 allocs;跨进程正确性由 `TestCrossProcess` 覆盖。 |
 | **M2: I/O 跑通** ⚠️部分验证 | Sendmsg/Recvfrom 自旋机制 | Sender/Receiver 单核 CPU 占用 100%,跨机完成百万级 QPS 裸发。已验证:单机 127.0.0.1 回环,64B 帧、Yield 空闲策略,约 960~1060 万 msgs/s,按序无丢失(`TestSendReceiveInOrder`,10 万条跨 3 个 term)。**未验证:跨机(EKS)、BusySpin 下单核 100% 占用(需阶段四绑核后在独立机器上测)。** |
-| **M3: 协议完善** | 重传与背压控制逻辑 | 丢包注入环境下,系统不发生 OOM,接收端严格按序组装日志。 |
+| **M3: 协议完善** ✅ | 重传与背压控制逻辑 | 丢包注入环境下,系统不发生 OOM,接收端严格按序组装日志。`TestLossyStrictOrderAndBoundedMemory`:双向 5% 丢包 + 2% 重复 + 5% 乱序,6.5 万条变长消息严格按序、无损坏,堆增长 < 8MB(日志为固定大小 mmap,不占堆);`TestBackPressureWhenReceiverStalls` 验证窗口耗尽时 `TryClaim` 返回 `ErrBackPressured`、消费者追上后恢复。丢包下吞吐受 NAK 周期(1ms)限制,约 5~6k msgs/s,属已知特性。 |
 
 ---
 
 ## 变更记录
 - 2026-11-08:初始计划入库。
+- 2026-11-08:阶段三完成(Conductor、NAK/重传、SM 滑动窗口与背压、心跳、客户端库 `client`)。
 - 2026-11-08:阶段二完成(回环验证;跨机待测);偏差:sendmmsg 与原始 recvfrom 代替 SendmsgN/Recvfrom。
 - 2026-11-08:阶段一完成;补充阶段一设计决策(CAS 追加、槽位状态机、单帧不分片)。

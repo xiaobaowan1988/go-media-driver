@@ -95,3 +95,39 @@ func (lb *LogBuffer) Insert(frame []byte) error {
 	atomic.StoreInt32(lenPtr(term, off), int32(flen))
 	return nil
 }
+
+// ContiguousEnd returns the end of the run of committed frames (DATA and PAD)
+// that begins at position. Receivers call it with their previous result, so
+// the cost is proportional to newly arrived data only.
+func (lb *LogBuffer) ContiguousEnd(position int64) int64 {
+	for {
+		count := position / lb.termLength
+		off := position % lb.termLength
+		term := lb.terms[count%3]
+		flen := atomic.LoadInt32(lenPtr(term, off))
+		if flen <= 0 || int64(flen) > lb.termLength-off || hdr(term, off).TermID != lb.initialID+int32(count) {
+			return position
+		}
+		position += int64(protocol.AlignedLength(int(flen)))
+	}
+}
+
+// GapEnd returns the end of the hole that starts at `from` (a position where
+// no frame has been received): the first frame boundary at or after from that
+// holds a frame, bounded by limit and by the end of from's term.
+func (lb *LogBuffer) GapEnd(from, limit int64) int64 {
+	count := from / lb.termLength
+	termEnd := (count + 1) * lb.termLength
+	if limit > termEnd {
+		limit = termEnd
+	}
+	term := lb.terms[count%3]
+	pos := from
+	for pos < limit {
+		if atomic.LoadInt32(lenPtr(term, pos%lb.termLength)) != 0 {
+			return pos
+		}
+		pos += protocol.FrameAlignment
+	}
+	return limit
+}

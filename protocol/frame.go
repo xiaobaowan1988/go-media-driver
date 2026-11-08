@@ -32,3 +32,31 @@ type DataHeader struct {
 
 // AlignedLength rounds n up to the frame alignment.
 func AlignedLength(n int) int { return (n + FrameAlignment - 1) &^ (FrameAlignment - 1) }
+
+// NakHeader asks the sender to retransmit [TermOffset, TermOffset+Length) of TermID.
+type NakHeader struct {
+	FrameLength int32
+	Version     uint8
+	Flags       uint8
+	Type        uint16
+	SessionID   int32
+	StreamID    int32
+	TermID      int32
+	TermOffset  int32
+	Length      int32
+	_           int32
+}
+
+// StatusMessage reports the receiver's consumer position and window.
+type StatusMessage struct {
+	FrameLength        int32
+	Version            uint8
+	Flags              uint8
+	Type               uint16
+	SessionID          int32
+	StreamID           int32
+	ConsumerTermID     int32
+	ConsumerTermOffset int32
+	ReceiverWindow     int32
+	_                  int32
+}

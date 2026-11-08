@@ -2,8 +2,8 @@ package driver
 
 import (
 	"encoding/binary"
-	"sync"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -58,13 +58,12 @@ func newRig(t testing.TB, idle Idle) *rig {
 		t.Fatal(err)
 	}
 	r := &rig{done: make(chan struct{})}
-	r.pub = NewNetworkPublication(outLB, txSock)
-	r.sub = NewNetworkSubscription(inLB)
+	r.pub = NewNetworkPublication(outLB, txSock, DefaultTiming(), window)
+	r.sub = NewNetworkSubscription(inLB, DefaultTiming(), window)
 	r.sender = NewSender(idle)
 	r.sender.AddPublication(r.pub)
 	r.recv = NewReceiver(rxSock, idle)
 	r.recv.AddSubscription(r.sub)
-	outLB.SetPublisherLimit(window) // until a status message exists (phase 3)
 	go r.sender.Run(&r.stop)
 	go func() { r.recv.Run(&r.stop); close(r.done) }()
 	t.Cleanup(func() {
@@ -80,8 +79,8 @@ func newRig(t testing.TB, idle Idle) *rig {
 	return r
 }
 
-// Phase-2 stand-in for flow control: the consumer advances the publisher
-// limit and cleans both logs. Phase 3 replaces this with SM frames.
+// Flow control is real (SM frames); this loop plays the application plus
+// the conductor's housekeeping (cleaning consumed terms).
 func (r *rig) consume(t testing.TB, total int, check func(i int, b []byte)) {
 	var pos int64
 	got := 0
@@ -94,8 +93,7 @@ func (r *rig) consume(t testing.TB, total int, check func(i int, b []byte)) {
 		}, 1024)
 		r.sub.lb.SetConsumerPosition(pos)
 		r.sub.lb.CleanConsumed(pos)
-		r.pub.lb.CleanConsumed(r.pub.SenderPosition())
-		r.pub.lb.SetPublisherLimit(pos + window)
+		r.pub.lb.CleanConsumed(r.pub.ConsumerPosition())
 		if n == 0 {
 			if time.Now().After(deadline) {
 				t.Fatalf("timeout: got %d/%d (recv datagrams=%d dropped=%d)", got, total, r.recv.Datagrams.Load(), r.sub.Dropped.Load())
