@@ -23,12 +23,17 @@ type rig struct {
 	sub    *NetworkSubscription
 	sender *Sender
 	recv   *Receiver
+	rx     *udp.Socket
 	stop   atomic.Bool
 	done   chan struct{}
 	prod   sync.WaitGroup // producer goroutines; cleanup waits before unmapping
 }
 
-func newRig(t testing.TB, idle Idle) *rig {
+func newRig(t testing.TB, idle Idle) *rig { return newRigOpts(t, idle, true) }
+
+// newRigOpts with start=false builds the pipeline without agent goroutines so
+// a test can drive the duty cycles itself, single threaded.
+func newRigOpts(t testing.TB, idle Idle, start bool) *rig {
 	t.Helper()
 	dir := t.TempDir()
 	cfg := logbuffer.Config{TermLength: termLen, InitialTermID: 100, MTU: 1408, SessionID: 9, StreamID: 3}
@@ -57,15 +62,19 @@ func newRig(t testing.TB, idle Idle) *rig {
 	if err := txSock.Connect([4]byte{127, 0, 0, 1}, port); err != nil {
 		t.Fatal(err)
 	}
-	r := &rig{done: make(chan struct{})}
+	r := &rig{done: make(chan struct{}), rx: rxSock}
 	r.pub = NewNetworkPublication(outLB, txSock, DefaultTiming(), window)
 	r.sub = NewNetworkSubscription(inLB, DefaultTiming(), window)
 	r.sender = NewSender(idle)
 	r.sender.AddPublication(r.pub)
 	r.recv = NewReceiver(rxSock, idle)
 	r.recv.AddSubscription(r.sub)
-	go r.sender.Run(&r.stop)
-	go func() { r.recv.Run(&r.stop); close(r.done) }()
+	if start {
+		go r.sender.Run(&r.stop)
+		go func() { r.recv.Run(&r.stop); close(r.done) }()
+	} else {
+		close(r.done)
+	}
 	t.Cleanup(func() {
 		r.stop.Store(true)
 		<-r.done

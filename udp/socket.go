@@ -10,6 +10,18 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// errnos holds pre-boxed Errno values so that reporting a syscall failure on
+// the hot path never allocates (boxing an Errno into an error would).
+var errnos = func() (t [256]error) {
+	for i := range t {
+		t[i] = unix.Errno(i)
+	}
+	return
+}()
+
+// errnoErr maps an errno to its pre-boxed error (Linux errnos are < 256).
+func errnoErr(e unix.Errno) error { return errnos[e&0xff] }
+
 // Socket owns a non-blocking IPv4 UDP socket plus pre-allocated send
 // batch state. It is NOT safe for concurrent use: one thread owns it.
 type Socket struct {
@@ -117,7 +129,7 @@ func (s *Socket) Flush() (int, error) {
 		if e == unix.EAGAIN || e == unix.ENOBUFS || e == unix.EINTR {
 			return 0, nil
 		}
-		return 0, e
+		return 0, errnoErr(e)
 	}
 	return int(r), nil
 }
@@ -139,7 +151,7 @@ func (s *Socket) SendTo(p []byte, to *unix.RawSockaddrInet4) (bool, error) {
 		if e == unix.EAGAIN || e == unix.ENOBUFS || e == unix.EINTR {
 			return false, nil
 		}
-		return false, e
+		return false, errnoErr(e)
 	}
 	return true, nil
 }
@@ -165,7 +177,7 @@ func (s *Socket) Recv(buf []byte) (int, error) {
 		if e == unix.EAGAIN || e == unix.EINTR {
 			return 0, nil
 		}
-		return 0, e
+		return 0, errnoErr(e)
 	}
 	return int(r), nil
 }

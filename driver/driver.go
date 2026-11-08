@@ -29,6 +29,12 @@ type Config struct {
 	Timing      Timing
 	Idle        Idle // for sender and receiver
 	SocketBuf   int  // SO_SNDBUF/SO_RCVBUF, default 4 MiB
+
+	// PinThreads pins the sender and receiver threads to SenderCPU and
+	// ReceiverCPU (use isolated cores). Without it the threads are still
+	// locked to their OS threads but may migrate between cores.
+	PinThreads             bool
+	SenderCPU, ReceiverCPU int
 }
 
 // Driver owns the three agents: sender, receiver and conductor.
@@ -86,10 +92,35 @@ func Start(cfg Config) (*Driver, error) {
 	}
 	d := &Driver{cfg: cfg, rxSock: rx, sender: NewSender(cfg.Idle), receiver: NewReceiver(rx, cfg.Idle)}
 	d.cond = newConductor(d, cmd)
+	sCPU, rCPU := -1, -1
+	if cfg.PinThreads {
+		sCPU, rCPU = cfg.SenderCPU, cfg.ReceiverCPU
+	}
+	pinErr := make(chan error, 2)
 	d.wg.Add(3)
-	go func() { defer d.wg.Done(); d.sender.Run(&d.stop) }()
-	go func() { defer d.wg.Done(); d.receiver.Run(&d.stop) }()
+	go func() {
+		defer d.wg.Done()
+		err := PinThread(sCPU)
+		pinErr <- err
+		if err == nil {
+			d.sender.Run(&d.stop)
+		}
+	}()
+	go func() {
+		defer d.wg.Done()
+		err := PinThread(rCPU)
+		pinErr <- err
+		if err == nil {
+			d.receiver.Run(&d.stop)
+		}
+	}()
 	go func() { defer d.wg.Done(); d.cond.Run(&d.stop) }()
+	for i := 0; i < 2; i++ {
+		if err := <-pinErr; err != nil {
+			d.Close()
+			return nil, err
+		}
+	}
 	return d, nil
 }
 

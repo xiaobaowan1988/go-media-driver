@@ -307,3 +307,73 @@ func TestUnknownRegistrationAndDuplicateSubscription(t *testing.T) {
 		t.Fatal("bad term length should be rejected")
 	}
 }
+
+// Sender and receiver threads pinned to their own cores (BusySpin where the
+// machine has cores to spare), publication looped back to the same driver.
+func TestPinnedBusySpinDriver(t *testing.T) {
+	cpus, err := driver.ThreadAffinity()
+	if err != nil || len(cpus) < 2 {
+		t.Skip("need at least 2 allowed CPUs")
+	}
+	idle := driver.Idle{Kind: driver.Yield}
+	if len(cpus) >= 4 {
+		idle = driver.Idle{Kind: driver.BusySpin}
+	}
+	d, err := driver.Start(driver.Config{
+		Dir: t.TempDir(), ReceiveIP: lo, Idle: idle,
+		PinThreads: true, SenderCPU: cpus[len(cpus)-1], ReceiverCPU: cpus[len(cpus)-2],
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	c, err := client.Connect(d.Dir(), 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	sub, err := c.AddSubscription(client.SubscriptionConfig{SessionID: 3, StreamID: 4, TermLength: termLen, Window: window})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub, err := c.AddPublication(client.PublicationConfig{SessionID: 3, StreamID: 4, RemoteIP: lo,
+		RemotePort: d.ReceivePort(), TermLength: termLen, InitialWindow: window})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const total = 100000
+	go func() {
+		var cl logbuffer.BufferClaim
+		for i := 0; i < total; {
+			if _, err := pub.TryClaim(24, &cl); err != nil {
+				runtime.Gosched()
+				continue
+			}
+			binary.LittleEndian.PutUint64(cl.Payload, uint64(i))
+			cl.Commit()
+			i++
+		}
+	}()
+	got := 0
+	for end := time.Now().Add(30 * time.Second); got < total; {
+		if sub.Poll(func(b []byte, _ *protocol.DataHeader) {
+			if binary.LittleEndian.Uint64(b) != uint64(got) {
+				t.Errorf("out of order at %d", got)
+			}
+			got++
+		}, 256) == 0 && time.Now().After(end) {
+			t.Fatalf("timeout at %d/%d", got, total)
+		}
+	}
+	pub.Close()
+	sub.Close()
+	if err := func() error {
+		bad, err := driver.Start(driver.Config{Dir: t.TempDir(), ReceiveIP: lo, PinThreads: true, SenderCPU: 100000})
+		if bad != nil {
+			bad.Close()
+		}
+		return err
+	}(); err == nil {
+		t.Fatal("Start must fail for an impossible CPU")
+	}
+}

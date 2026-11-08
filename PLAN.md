@@ -50,10 +50,10 @@
 ## 阶段四:彻底击穿 Go 调度器 (Week 7)
 **目标**:消除 Go 运行时 (Runtime) 带来的微秒级延迟抖动。
 
-- [ ] **OS 物理线程绑定 (Thread Pinning)**
+- [x] **OS 物理线程绑定 (Thread Pinning)**
   - 在 Sender 和 Receiver 的 Goroutine 入口处注入 `runtime.LockOSThread()`。
   - 引入 `unix.SchedSetaffinity`,将这两个数据面 Goroutine 硬绑定到特定的物理 CPU 核心上(隔离核),杜绝调度器抢占。
-- [ ] **热路径零堆分配 (Zero Allocation)**
+- [x] **热路径零堆分配 (Zero Allocation)**
   - 结合 `go build -gcflags="-m"` 执行严格的逃逸分析。
   - 确保 Sender/Receiver 循环内 **0 次堆内存分配**(无 `make`、无指针切片逃逸、无接口类型断言),完全避开 GC 扫描。
 
@@ -86,6 +86,11 @@
 - 简化:不实现 SETUP 握手(两端 term 长度/初始 termID/MTU 由命令静态配置,Raft 集群成员本来就是静态已知);一个驱动只有一个接收端点(`ReceiveIP:ReceivePort`),按 (session,stream) 分发;发布侧每个 publication 一个 connected socket。
 - 测试:`TestLossy*` 用用户态 UDP 代理注入丢包/重复/乱序(双向),验证按序无丢失、堆内存不增长、窗口耗尽时背压。
 
+### 阶段四
+- **线程绑定**(`driver/pin.go`):Sender/Receiver goroutine 入口先 `runtime.LockOSThread()`,再用 `unix.SchedSetaffinity(0, cpuset)`(pid 0 = 调用线程)绑核。goroutine 退出时**不** `UnlockOSThread`,让 Go 运行时销毁该线程,避免把已改过亲和性的线程还回线程池。`Config.PinThreads` 为 true 时才绑核(`SenderCPU`/`ReceiverCPU`);无论是否绑核,数据面线程都会 LockOSThread。绑核失败(CPU 不在允许集合内等)使 `Start` 返回错误。隔离核本身需要运维配合(内核参数 `isolcpus=`/`nohz_full=`、cgroup cpuset、EKS 上用 static CPU manager policy 且 Guaranteed QoS),代码侧不负责。
+- **零分配验证分三层**:① `TestHotPathZeroAlloc`:单线程驱动完整流水线(TryClaim→Commit→Sender→UDP→Receiver→Poll),并通过"偷走部分数据报"制造丢包,使 NAK/SM/重传/心跳路径都在测量范围内,`testing.AllocsPerRun` 必须为 0;② `cmd/escapecheck`:对热路径函数清单做 AST 检查(禁止 `make`/`new`/`append`/`&T{}`/切片或 map 字面量/闭包/类型断言/type switch),并解析 `go build -gcflags=-m` 输出,清单函数体内出现 `escapes to heap`/`moved to heap` 即失败;③ `scripts/escape-check.sh` 把②暴露给 CI。
+- 热路径清单:`logbuffer`:TryClaim/Commit/Poll/ScanBlock/Insert/ContiguousEnd/GapEnd/CleanConsumed/rotate;`udp`:Add/Flush/Recv/Send/SendTo;`driver`:Sender.DoWork、NetworkPublication.{doWork,send,pollControl,onSM,onNak,retransmitOne,heartbeat}、Receiver.DoWork、NetworkSubscription.{onDatagram,housekeeping}。
+
 ### 里程碑与验收标准
 | 里程碑 | 核心产出 | 验收标准 |
 | :--- | :--- | :--- |
@@ -95,8 +100,15 @@
 
 ---
 
+## 已知限制与后续(未纳入四个阶段)
+- 未做跨机/EKS 实测:M2 的"跨机百万级 QPS"与"单核 100%"、以及绑核对尾延迟抖动的实际收益,需在带隔离核的真实机器上测量。
+- 单帧不分片(负载 ≤ MTU-32);EKS VPC CNI 的 MTU 通常为 9001,可把 MTU 配到 8960 以内以容纳更大的 Raft 条目。
+- 无 SETUP 握手、无多接收端/多播、无驱动崩溃恢复(客户端崩溃后其 resp 文件需外部清理)、无 SM 丢失之外的拥塞控制。
+- 数据面使用 Linux 专有接口(sendmmsg、sched_setaffinity、/dev/shm),仅支持 Linux;帧格式为小端主机序(amd64/arm64)。
+
 ## 变更记录
 - 2026-11-08:初始计划入库。
+- 2026-11-08:阶段四完成(`PinThread`/`Config.PinThreads`、`TestHotPathZeroAlloc`、`cmd/escapecheck`;逃逸分析发现并修复了错误路径上 Errno 装箱的堆分配)。
 - 2026-11-08:阶段三完成(Conductor、NAK/重传、SM 滑动窗口与背压、心跳、客户端库 `client`)。
 - 2026-11-08:阶段二完成(回环验证;跨机待测);偏差:sendmmsg 与原始 recvfrom 代替 SendmsgN/Recvfrom。
 - 2026-11-08:阶段一完成;补充阶段一设计决策(CAS 追加、槽位状态机、单帧不分片)。
