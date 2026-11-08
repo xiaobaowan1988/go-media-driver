@@ -9,13 +9,13 @@
 ## 阶段一:内存 IPC 与零拷贝基石 (Weeks 1-2)
 **目标**:脱离网络层,在本地进程间通过 `/dev/shm` 建立无锁的 LogBuffer 机制。
 
-- [ ] **共享内存映射机制**
+- [x] **共享内存映射机制**
   - 使用 `golang.org/x/sys/unix` 封装底层 `Mmap` 和 `Munmap`。
   - 实现跨进程的内存文件挂载,确保 Raft 业务端和 Media Driver 进程映射到相同的物理内存页。
-- [ ] **LogBuffer 结构与 CPU 对齐**
+- [x] **LogBuffer 结构与 CPU 对齐**
   - 定义标准 Aeron 内存布局:`Active Term` + `Dirty Term` + `Clean Term` + `MetaData`。
   - **性能调优**:在 Go 状态结构体中强行插入 `_ [56]byte` 补齐 64 字节缓存行(Cache Line Padding),彻底杜绝发送端与接收端并发更新偏移量时的 False Sharing(伪共享)。
-- [ ] **无锁原子操作库封装**
+- [x] **无锁原子操作库封装**
   - 基于 `sync/atomic` 封装带有顺序一致性内存屏障的读取与写入。
   - 开发 `TryClaim` 和 `Commit` 接口,支持 Raft 日志以 CAS(Compare-And-Swap)方式原子追加。
 
@@ -58,10 +58,21 @@
 
 ---
 
+## 设计决策(随实现补充,代码与此处不一致时先改此处)
+
+### 阶段一
+- 包结构:`shm`(mmap)、`protocol`(帧格式,Aeron 32 字节 DATA 头,小端)、`logbuffer`(日志缓冲)。
+- 文件布局:`[term0][term1][term2][metadata 4096B]`,term 长度为 2 的幂(64KiB ~ 1GiB)。metadata 内每个热点计数器独占 64 字节缓存行(`V int64` + `_ [56]byte`)。
+- Aeron 的 Active/Dirty/Clean 角色由 `ActiveTermCount` 动态推导:active=`count%3`,下一个要启用的槽位(`(count+1)%3`)必须处于 clean 状态才能轮转。每个槽位有状态机 `clean → active → dirty → clean`,由 CAS 保护,清理方(Conductor/消费者)只清理"已被消费者位置越过"的 dirty 槽位。
+- Tail 计数器打包为 `termID<<32 | termOffset`。**追加使用 CAS 循环**(而非 fetch-add),因此永不越过 term 末尾;放不下时由 CAS 获胜者写 padding 帧并轮转。
+- `TryClaim(length)` 返回新位置或哨兵错误(`ErrBackPressured`/`ErrAdminAction`/`ErrMaxMessageLength`,预分配,不产生堆分配);`Commit` 以原子 store 写入帧长度(读端以"长度>0"判定可见)。
+- 第一版**不做分片**:单帧负载上限 `MTU-32`,更大的 Raft 条目由上层拆分。
+- `PublisherLimit`(metadata 字段)用于背压:默认 `MaxInt64`,阶段三由驱动按 SM 更新。
+
 ### 里程碑与验收标准
 | 里程碑 | 核心产出 | 验收标准 |
 | :--- | :--- | :--- |
-| **M1: IPC 联通** | LogBuffer 结构与 CAS 写机制 | 假 Media Driver 进程与 Raft 进程本地内存读写达到千万级 QPS。 |
+| **M1: IPC 联通** ✅ | LogBuffer 结构与 CAS 写机制 | 假 Media Driver 进程与 Raft 进程本地内存读写达到千万级 QPS。实测(4 核沙箱,生产者/消费者两个 goroutine,32B 负载):1600~2100 万 msgs/s,0 allocs;跨进程正确性由 `TestCrossProcess` 覆盖。 |
 | **M2: I/O 跑通** | Sendmsg/Recvfrom 自旋机制 | Sender/Receiver 单核 CPU 占用 100%,跨机完成百万级 QPS 裸发。 |
 | **M3: 协议完善** | 重传与背压控制逻辑 | 丢包注入环境下,系统不发生 OOM,接收端严格按序组装日志。 |
 
@@ -69,3 +80,4 @@
 
 ## 变更记录
 - 2026-11-08:初始计划入库。
+- 2026-11-08:阶段一完成;补充阶段一设计决策(CAS 追加、槽位状态机、单帧不分片)。
