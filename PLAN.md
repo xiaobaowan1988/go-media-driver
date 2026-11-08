@@ -22,16 +22,17 @@
 ## 阶段二:数据面网络 I/O 极速改造 (Weeks 3-4)
 **目标**:抛弃 Go 标准 `net` 库,基于 `sendmsg` 实现免陷入调度器的极速收发。
 
-- [ ] **原生非阻塞 Socket 接管**
+- [x] **原生非阻塞 Socket 接管**
   - 使用 `unix.Socket` 创建纯净的 IPv4 UDP Socket,并通过 `unix.SetNonblock` 强制开启非阻塞模式。
-- [ ] **Sender 发送线程 (微批处理)**
+- [x] **Sender 发送线程 (微批处理)**
   - 构建 Busy Spin(自旋)死循环。
-  - 预先分配 `[]unix.Iovec` 数组。
-  - 从 LogBuffer 扫描连续块,将物理指针直接挂载到 `Iovec`,调用 `unix.SendmsgN` 触发网卡 DMA 聚集发送(Scatter/Gather),消除用户态数据拼接拷贝。
-- [ ] **Receiver 接收线程 (直接拷贝)**
-  - 构建 Busy Spin(自旋)死循环,使用 `unix.Recvfrom` 拉取数据。
-  - 使用 `unsafe.Pointer` 极速强转提取 Aeron Header 序列号。
-  - 计算 Inbound LogBuffer 的绝对物理地址,通过纯 CPU 缓存完成 `fastMemoryCopy`。
+  - 预先分配 `[]unix.Iovec` 与 `[]unix.Mmsghdr` 数组。
+  - 从 LogBuffer 扫描连续块(每个数据报 ≤ MTU,可含多个相邻帧),将物理指针直接挂载到 `Iovec`,以**一次 `sendmmsg` 系统调用发出整批数据报**(sendmsg 的批量形态,微批处理的本体),内核直接从共享内存聚集发送,消除用户态数据拼接拷贝。
+  - 偏差说明:`unix.SendmsgN` 每次只发一个数据报且每次调用会构造 iovec,无法满足"预分配 Iovec + 零分配 + 批量",故改用 `unix.RawSyscall6(SYS_SENDMMSG)`;Socket 为非阻塞,不会阻塞线程,所以用 RawSyscall(不经调度器 entersyscall)。
+- [x] **Receiver 接收线程 (直接拷贝)**
+  - 构建 Busy Spin(自旋)死循环,拉取数据。偏差说明:`unix.Recvfrom` 每次返回新的 `Sockaddr`(堆分配),故改用 `RawSyscall6(SYS_RECVFROM)` + 预分配的 `RawSockaddrAny` 记录对端地址。
+  - 使用 `unsafe.Pointer` 极速强转提取 Aeron Header 序列号(termID/termOffset)。
+  - 计算 Inbound LogBuffer 的绝对物理地址,直接拷贝入位(`fastMemoryCopy` 即 Go 的 `copy`,运行时 memmove);先拷贝帧体,最后原子写入帧长度使其对读者可见;重复帧(重传)与已消费区域的迟到帧被丢弃。
 
 ## 阶段三:控制面与流控状态机 (Weeks 5-6)
 **目标**:实现网络异常处理、丢包重传与滑动窗口机制。
@@ -69,15 +70,23 @@
 - 第一版**不做分片**:单帧负载上限 `MTU-32`,更大的 Raft 条目由上层拆分。
 - `PublisherLimit`(metadata 字段)用于背压:默认 `MaxInt64`,阶段三由驱动按 SM 更新。
 
+### 阶段二
+- 包 `udp`:原始非阻塞 IPv4 UDP Socket(`unix.Socket` + `unix.SetNonblock`),批量发送(Add/Flush)与接收均零分配;EAGAIN 以"0 个"返回而非错误。
+- `logbuffer.ScanBlock(pos, maxLen)`:从 `pos` 起收集 ≤ maxLen 的连续已提交帧(不跨 term、不含 padding;padding 帧单独以 32 字节头发送,头里的 frame_length 为整段 padding 长度)。MTU 必须是 32 的倍数。
+- `logbuffer.Insert(frame)`:接收端重建;term 窗口为 `[active-1, active+1]`,`active+1` 需槽位已清理才会激活;顺序为"先查重复(长度>0)→再读 ConsumerPosition 判断是否已消费",以避免把迟到帧写进已清理的槽位。
+- 协议简化:Sender 的 Socket 对接收端 `connect`;接收端用 `recvfrom` 学到对端地址(阶段三回 SM/NAK 用)。阶段二尚无流控,测试中用"消费者推进 PublisherLimit"代替 SM。
+- 驱动类型:`driver.NetworkPublication`(发送侧状态)、`driver.Sender`(duty cycle `DoWork`/`Run`)、`driver.NetworkSubscription`、`driver.Receiver`。空闲策略 `IdleStrategy` 支持 BusySpin(默认)/Yield/Sleep,测试里用 Yield 以免在小核数机器上饿死别的 goroutine。
+
 ### 里程碑与验收标准
 | 里程碑 | 核心产出 | 验收标准 |
 | :--- | :--- | :--- |
 | **M1: IPC 联通** ✅ | LogBuffer 结构与 CAS 写机制 | 假 Media Driver 进程与 Raft 进程本地内存读写达到千万级 QPS。实测(4 核沙箱,生产者/消费者两个 goroutine,32B 负载):1600~2100 万 msgs/s,0 allocs;跨进程正确性由 `TestCrossProcess` 覆盖。 |
-| **M2: I/O 跑通** | Sendmsg/Recvfrom 自旋机制 | Sender/Receiver 单核 CPU 占用 100%,跨机完成百万级 QPS 裸发。 |
+| **M2: I/O 跑通** ⚠️部分验证 | Sendmsg/Recvfrom 自旋机制 | Sender/Receiver 单核 CPU 占用 100%,跨机完成百万级 QPS 裸发。已验证:单机 127.0.0.1 回环,64B 帧、Yield 空闲策略,约 960~1060 万 msgs/s,按序无丢失(`TestSendReceiveInOrder`,10 万条跨 3 个 term)。**未验证:跨机(EKS)、BusySpin 下单核 100% 占用(需阶段四绑核后在独立机器上测)。** |
 | **M3: 协议完善** | 重传与背压控制逻辑 | 丢包注入环境下,系统不发生 OOM,接收端严格按序组装日志。 |
 
 ---
 
 ## 变更记录
 - 2026-11-08:初始计划入库。
+- 2026-11-08:阶段二完成(回环验证;跨机待测);偏差:sendmmsg 与原始 recvfrom 代替 SendmsgN/Recvfrom。
 - 2026-11-08:阶段一完成;补充阶段一设计决策(CAS 追加、槽位状态机、单帧不分片)。

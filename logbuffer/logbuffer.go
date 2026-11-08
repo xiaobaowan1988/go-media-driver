@@ -19,6 +19,11 @@ var (
 	ErrBackPressured    = errors.New("logbuffer: back pressured")
 	ErrAdminAction      = errors.New("logbuffer: admin action (term rotation), retry")
 	ErrMaxMessageLength = errors.New("logbuffer: message exceeds MTU-header")
+
+	// Insert (receive side) results.
+	ErrStale    = errors.New("logbuffer: frame already consumed")
+	ErrFuture   = errors.New("logbuffer: frame beyond receive window")
+	ErrBadFrame = errors.New("logbuffer: malformed frame")
 )
 
 // LogBuffer is a view over a mapped log file. All methods are safe for
@@ -54,7 +59,7 @@ func Create(path string, c Config) (*LogBuffer, error) {
 	if !validTermLength(c.TermLength) {
 		return nil, fmt.Errorf("logbuffer: term length %d must be a power of two in [%d,%d]", c.TermLength, MinTermLength, MaxTermLength)
 	}
-	if c.MTU < 2*protocol.HeaderLength || c.MTU > c.TermLength/8 {
+	if c.MTU < 2*protocol.HeaderLength || c.MTU > c.TermLength/8 || c.MTU%protocol.FrameAlignment != 0 {
 		return nil, fmt.Errorf("logbuffer: invalid mtu %d", c.MTU)
 	}
 	m, err := shm.Create(path, FileLength(c.TermLength), c.Prefault)

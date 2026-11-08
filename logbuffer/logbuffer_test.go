@@ -29,9 +29,9 @@ func newLB(t testing.TB, termLength, mtu int) *LogBuffer {
 func TestLayout(t *testing.T) {
 	var m Metadata
 	for name, off := range map[string]uintptr{
-		"Tail[1]": unsafe.Offsetof(m.Tail)+64, "ActiveTermCount": unsafe.Offsetof(m.ActiveTermCount),
+		"Tail[1]": unsafe.Offsetof(m.Tail) + 64, "ActiveTermCount": unsafe.Offsetof(m.ActiveTermCount),
 		"PublisherLimit": unsafe.Offsetof(m.PublisherLimit), "ConsumerPosition": unsafe.Offsetof(m.ConsumerPosition),
-		"State[1]": unsafe.Offsetof(m.State)+64,
+		"State[1]": unsafe.Offsetof(m.State) + 64,
 	} {
 		if off%64 != 0 {
 			t.Errorf("%s at %d not cache-line aligned", name, off)
@@ -230,8 +230,13 @@ type syncBuf struct {
 	b  []byte
 }
 
-func (s *syncBuf) Write(p []byte) (int, error) { s.mu.Lock(); s.b = append(s.b, p...); s.mu.Unlock(); return len(p), nil }
-func (s *syncBuf) String() string              { s.mu.Lock(); defer s.mu.Unlock(); return string(s.b) }
+func (s *syncBuf) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	s.b = append(s.b, p...)
+	s.mu.Unlock()
+	return len(p), nil
+}
+func (s *syncBuf) String() string { s.mu.Lock(); defer s.mu.Unlock(); return string(s.b) }
 
 func TestHelperDriver(t *testing.T) {
 	if os.Getenv("GMD_HELPER") != "1" {

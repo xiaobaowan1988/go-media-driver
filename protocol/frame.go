@@ -11,9 +11,9 @@ const (
 	TypeNak  uint16 = 2
 	TypeSM   uint16 = 3
 
-	FlagBegin       uint8 = 0x80
-	FlagEnd         uint8 = 0x40
-	FlagUnfragmented      = FlagBegin | FlagEnd
+	FlagBegin        uint8 = 0x80
+	FlagEnd          uint8 = 0x40
+	FlagUnfragmented       = FlagBegin | FlagEnd
 )
 
 // DataHeader is the header of DATA and PAD frames. FrameLength is written
